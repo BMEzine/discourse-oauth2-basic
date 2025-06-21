@@ -204,10 +204,10 @@ class OAuth2BasicAuthenticator < Auth::ManagedAuthenticator
     SiteSetting.oauth2_overrides_email
   end
 
-  def synchronize_groups(user)
-    log("synchronizing groups: #{user.groups}")
-   
-    names = (groups || "").split(",").map(&:downcase).map(&:gsub, " ", "_")
+  def synchronize_groups(user, groups)
+    log("synchronizing groups for user #{user.username}: #{groups}")
+    
+    names = (groups || "").split(",").map(&:downcase).map { |name| name.gsub(" ", "_") }
 
     current_groups = user.groups.where(automatic: false)
     desired_groups = Group.where("LOWER(NAME) in (?) AND NOT automatic", names)
@@ -274,7 +274,7 @@ class OAuth2BasicAuthenticator < Auth::ManagedAuthenticator
         end
 
         if SiteSetting.oauth2_synchronize_groups
-          synchronize_groups(user)
+          auth["extra"]["groups"] = fetched_user_details[:groups]
         end
 
         DiscoursePluginRegistry.oauth2_basic_additional_json_paths.each do |detail|
@@ -297,7 +297,22 @@ class OAuth2BasicAuthenticator < Auth::ManagedAuthenticator
       end
     end
 
-    super(auth, existing_account: existing_account)
+    # Call parent method to handle normal authentication
+    result = super(auth, existing_account: existing_account)
+    
+    # Handle group synchronization for existing users
+    if result.user && SiteSetting.oauth2_synchronize_groups && auth["extra"] && auth["extra"]["groups"]
+      synchronize_groups(result.user, auth["extra"]["groups"])
+    end
+    
+    result
+  end
+
+  def after_create_account(user, auth)
+    if SiteSetting.oauth2_synchronize_groups && auth["extra"] && auth["extra"]["groups"]
+      synchronize_groups(user, auth["extra"]["groups"])
+    end
+    super(user, auth)
   end
 
   def enabled?
