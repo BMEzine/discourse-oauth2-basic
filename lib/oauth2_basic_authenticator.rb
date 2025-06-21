@@ -232,6 +232,10 @@ class OAuth2BasicAuthenticator < Auth::ManagedAuthenticator
 
   def add_user_to_groups(user, groups)
     groups.each do |group|
+      group = Group.find_by(name: group)
+      if group.blank?
+        group = Group.create!(name: group, automatic: false)
+      end
       GroupUser.create!(user_id: user.id, group_id: group.id)
       GroupActionLogger.new(Discourse.system_user, group).log_add_user_to_group(user)
     end
