@@ -206,8 +206,8 @@ class OAuth2BasicAuthenticator < Auth::ManagedAuthenticator
 
   def synchronize_groups(user, groups)
     log("synchronizing groups for user #{user.username}: #{groups}")
-    
-    names = (groups || "").split(",").map(&:downcase).map { |name| name.gsub(" ", "_") }
+
+    names = groups.map(&:downcase).map { |name| name.gsub(" ", "_") }
 
     log("groups: #{names}")
 
