@@ -209,6 +209,16 @@ class OAuth2BasicAuthenticator < Auth::ManagedAuthenticator
     
     names = (groups || "").split(",").map(&:downcase).map { |name| name.gsub(" ", "_") }
 
+    log("groups: #{names}")
+
+    names.each do |name|
+      group = Group.find_by(name: name)
+      if group.blank?
+        log("creating group #{name}")
+        group = Group.create!(name: name, automatic: false)
+      end
+    end
+
     current_groups = user.groups.where(automatic: false)
     desired_groups = Group.where("LOWER(NAME) in (?) AND NOT automatic", names)
 
@@ -231,17 +241,15 @@ class OAuth2BasicAuthenticator < Auth::ManagedAuthenticator
   end
 
   def add_user_to_groups(user, groups)
+    log("adding user #{user.username} to groups: #{groups}")
     groups.each do |group|
-      group = Group.find_by(name: group)
-      if group.blank?
-        group = Group.create!(name: group, automatic: false)
-      end
       GroupUser.create!(user_id: user.id, group_id: group.id)
       GroupActionLogger.new(Discourse.system_user, group).log_add_user_to_group(user)
     end
   end
 
   def remove_user_from_groups(user, groups)
+    log("removing user #{user.username} from groups: #{groups}")
     GroupUser.where(user_id: user.id, group_id: groups.map(&:id)).destroy_all
     groups.each do |group|
       GroupActionLogger.new(Discourse.system_user, group).log_remove_user_from_group(user)
