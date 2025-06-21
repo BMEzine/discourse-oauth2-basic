@@ -179,6 +179,7 @@ class OAuth2BasicAuthenticator < Auth::ManagedAuthenticator
         json_walk(result, user_json, :email)
         json_walk(result, user_json, :email_verified)
         json_walk(result, user_json, :avatar)
+        json_walk(result, user_json, :groups)
 
         DiscoursePluginRegistry.oauth2_basic_additional_json_paths.each do |detail|
           prop = "extra:#{detail}"
@@ -201,6 +202,46 @@ class OAuth2BasicAuthenticator < Auth::ManagedAuthenticator
 
   def always_update_user_email?
     SiteSetting.oauth2_overrides_email
+  end
+
+  def synchronize_groups(user)
+    log("synchronizing groups: #{user.groups}")
+   
+    names = (groups || "").split(",").map(&:downcase).map(&:gsub, " ", "_")
+
+    current_groups = user.groups.where(automatic: false)
+    desired_groups = Group.where("LOWER(NAME) in (?) AND NOT automatic", names)
+
+    to_be_added = desired_groups
+    if current_groups.present?
+      to_be_added = to_be_added.where("groups.id NOT IN (?)", current_groups.map(&:id))
+    end
+
+    to_be_removed = current_groups
+    if desired_groups.present?
+      to_be_removed = to_be_removed.where("groups.id NOT IN (?)", desired_groups.map(&:id))
+    end
+
+    if to_be_added.present? || to_be_removed.present?
+      GroupUser.transaction do
+        add_user_to_groups(user, to_be_added) if to_be_added.present?
+        remove_user_from_groups(user, to_be_removed) if to_be_removed.present?
+      end
+    end
+  end
+
+  def add_user_to_groups(user, groups)
+    groups.each do |group|
+      GroupUser.create!(user_id: user.id, group_id: group.id)
+      GroupActionLogger.new(Discourse.system_user, group).log_add_user_to_group(user)
+    end
+  end
+
+  def remove_user_from_groups(user, groups)
+    GroupUser.where(user_id: user.id, group_id: groups.map(&:id)).destroy_all
+    groups.each do |group|
+      GroupActionLogger.new(Discourse.system_user, group).log_remove_user_from_group(user)
+    end
   end
 
   def after_authenticate(auth, existing_account: nil)
@@ -232,6 +273,10 @@ class OAuth2BasicAuthenticator < Auth::ManagedAuthenticator
           ]
         end
 
+        if SiteSetting.oauth2_synchronize_groups
+          synchronize_groups(user)
+        end
+
         DiscoursePluginRegistry.oauth2_basic_additional_json_paths.each do |detail|
           auth["extra"][detail] = fetched_user_details["extra:#{detail}"]
         end
@@ -259,3 +304,5 @@ class OAuth2BasicAuthenticator < Auth::ManagedAuthenticator
     SiteSetting.oauth2_enabled
   end
 end
+
+
