@@ -395,4 +395,317 @@ describe OAuth2BasicAuthenticator do
       expect(result.email).to eq "sammy@digitalocean.com"
     end
   end
+
+  describe "group synchronization" do
+    let(:user) { Fabricate(:user) }
+    let(:authenticator) { OAuth2BasicAuthenticator.new }
+    let(:group1) { Fabricate(:group, name: "developers", automatic: false) }
+    let(:group2) { Fabricate(:group, name: "admins", automatic: false) }
+    let(:group3) { Fabricate(:group, name: "managers", automatic: false) }
+
+    let(:auth_with_groups) do
+      OmniAuth::AuthHash.new(
+        "provider" => "oauth2_basic",
+        "credentials" => { token: "token" },
+        "uid" => "123456789",
+        "info" => { id: "id" },
+        "extra" => { "groups" => ["developers", "admins"] }
+      )
+    end
+
+    before do
+      SiteSetting.oauth2_enabled = true
+      SiteSetting.oauth2_fetch_user_details = true
+      SiteSetting.oauth2_user_json_url = "https://provider.com/user"
+      SiteSetting.oauth2_json_groups_path = "groups"
+      SiteSetting.oauth2_synchronize_groups = true
+    end
+
+    describe "synchronize_groups method" do
+      it "creates groups that don't exist" do
+        expect { 
+          authenticator.synchronize_groups(user, ["newgroup1", "newgroup2"]) 
+        }.to change { Group.count }.by(2)
+        
+        expect(Group.find_by(name: "newgroup1")).to be_present
+        expect(Group.find_by(name: "newgroup2")).to be_present
+      end
+
+      it "adds user to specified groups" do
+        group1 # create the group
+        group2 # create the group
+        
+        expect { 
+          authenticator.synchronize_groups(user, ["developers", "admins"]) 
+        }.to change { user.groups.count }.by(2)
+        
+        expect(user.groups).to include(group1, group2)
+      end
+
+      it "removes user from groups not in the list" do
+        group1 # create the group  
+        group2 # create the group
+        group3 # create the group
+        
+        # Add user to all three groups initially
+        user.groups << [group1, group2, group3]
+        
+        # Synchronize with only two groups
+        expect { 
+          authenticator.synchronize_groups(user, ["developers", "admins"]) 
+        }.to change { user.groups.count }.from(3).to(2)
+        
+        expect(user.groups).to include(group1, group2)
+        expect(user.groups).not_to include(group3)
+      end
+
+      it "handles mixed case group names" do
+        authenticator.synchronize_groups(user, ["Developers", "ADMINS"])
+        
+        # Should create lowercase groups
+        expect(Group.find_by(name: "developers")).to be_present
+        expect(Group.find_by(name: "admins")).to be_present
+        expect(user.groups.pluck(:name)).to include("developers", "admins")
+      end
+
+      it "handles group names with spaces" do
+        authenticator.synchronize_groups(user, ["Project Managers", "Team Leads"])
+        
+        # Should create groups with underscores
+        expect(Group.find_by(name: "project_managers")).to be_present
+        expect(Group.find_by(name: "team_leads")).to be_present
+      end
+
+      it "doesn't affect automatic groups" do
+        automatic_group = Fabricate(:group, name: "trust_level_1", automatic: true)
+        user.groups << automatic_group
+        
+        original_count = user.groups.where(automatic: true).count
+        authenticator.synchronize_groups(user, ["developers"])
+        
+        expect(user.groups.where(automatic: true).count).to eq(original_count)
+        expect(user.groups).to include(automatic_group)
+      end
+
+      it "logs group synchronization activity" do
+        SiteSetting.oauth2_debug_auth = true
+        
+        Rails.logger.expects(:warn).with(regexp_matches(/synchronizing groups for user/))
+        Rails.logger.expects(:warn).with(regexp_matches(/processed group names: /))
+        Rails.logger.expects(:warn).with(regexp_matches(/creating group/)).at_least_once
+        
+        authenticator.synchronize_groups(user, ["newgroup"])
+      end
+
+      it "handles empty groups list" do
+        group1 # create the group
+        user.groups << group1
+        
+        expect { 
+          authenticator.synchronize_groups(user, []) 
+        }.to change { user.groups.count }.from(1).to(0)
+      end
+
+      it "handles nil groups parameter" do
+        expect { 
+          authenticator.synchronize_groups(user, nil) 
+        }.not_to raise_error
+      end
+
+      it "handles string input with comma-separated groups" do
+        expect { 
+          authenticator.synchronize_groups(user, "developers,admins, managers") 
+        }.to change { Group.count }.by(3)
+        
+        expect(Group.find_by(name: "developers")).to be_present
+        expect(Group.find_by(name: "admins")).to be_present
+        expect(Group.find_by(name: "managers")).to be_present
+        expect(user.groups.pluck(:name)).to include("developers", "admins", "managers")
+      end
+
+      it "handles empty string input" do
+        group1 # create group
+        user.groups << group1
+        
+        expect { 
+          authenticator.synchronize_groups(user, "") 
+        }.to change { user.groups.count }.from(1).to(0)
+      end
+
+      it "handles mixed data types in array" do
+        expect { 
+          authenticator.synchronize_groups(user, ["developers", :admins, 123]) 
+        }.to change { Group.count }.by(3)
+        
+        expect(Group.find_by(name: "developers")).to be_present
+        expect(Group.find_by(name: "admins")).to be_present
+        expect(Group.find_by(name: "123")).to be_present
+      end
+
+      it "ignores blank group names" do
+        expect { 
+          authenticator.synchronize_groups(user, ["developers", "", "  ", "admins"]) 
+        }.to change { Group.count }.by(2)
+        
+        expect(Group.find_by(name: "developers")).to be_present
+        expect(Group.find_by(name: "admins")).to be_present
+        expect(user.groups.count).to eq(2)
+      end
+    end
+
+    describe "after_authenticate with group sync" do
+      before do
+        # Mock the HTTP request for user details
+        stub_request(:get, SiteSetting.oauth2_user_json_url)
+          .to_return(
+            status: 200,
+            body: '{"email":"test@example.com","groups":["developers","admins"]}'
+          )
+        SiteSetting.oauth2_json_email_path = "email"
+        SiteSetting.oauth2_json_groups_path = "groups"
+      end
+
+      it "synchronizes groups for existing users" do
+        existing_user = Fabricate(:user, email: "test@example.com")
+        group1 # create groups
+        group2
+        
+        result = authenticator.after_authenticate(auth_with_groups)
+        
+        expect(result.user).to eq(existing_user)
+        expect(existing_user.reload.groups).to include(group1, group2)
+      end
+
+      it "stores groups in auth extra for new users" do
+        auth_with_groups["info"]["email"] = "newuser@example.com"
+        
+        result = authenticator.after_authenticate(auth_with_groups)
+        
+        expect(result.extra_data).to be_present
+        # The groups should be stored for later processing in after_create_account
+      end
+
+      it "doesn't sync groups when setting is disabled" do
+        SiteSetting.oauth2_synchronize_groups = false
+        existing_user = Fabricate(:user, email: "test@example.com")
+        
+        result = authenticator.after_authenticate(auth_with_groups)
+        
+        expect(existing_user.reload.groups.where(automatic: false)).to be_empty
+      end
+
+      it "doesn't sync groups when fetch_user_details is disabled" do
+        SiteSetting.oauth2_fetch_user_details = false
+        existing_user = Fabricate(:user, email: "test@example.com")
+        
+        result = authenticator.after_authenticate(auth_with_groups)
+        
+        expect(existing_user.reload.groups.where(automatic: false)).to be_empty
+      end
+    end
+
+    describe "after_create_account with group sync" do
+      let(:new_user) { Fabricate.build(:user, email: "newuser@example.com") }
+      let(:auth_result) do
+        auth_hash = auth_with_groups.dup
+        auth_hash["extra"]["groups"] = ["developers", "managers"]
+        auth_hash
+      end
+
+      it "synchronizes groups for new users" do
+        group1 # create groups
+        group3
+        
+        authenticator.after_create_account(new_user, auth_result)
+        
+        expect(new_user.groups).to include(group1, group3)
+      end
+
+      it "creates groups that don't exist during account creation" do
+        expect { 
+          authenticator.after_create_account(new_user, auth_result) 
+        }.to change { Group.count }.by(2)
+        
+        expect(Group.find_by(name: "developers")).to be_present
+        expect(Group.find_by(name: "managers")).to be_present
+      end
+
+      it "doesn't sync groups when setting is disabled" do
+        SiteSetting.oauth2_synchronize_groups = false
+        
+        authenticator.after_create_account(new_user, auth_result)
+        
+        expect(new_user.groups.where(automatic: false)).to be_empty
+      end
+
+      it "handles missing groups data gracefully" do
+        auth_without_groups = auth_with_groups.dup
+        auth_without_groups["extra"].delete("groups")
+        
+        expect { 
+          authenticator.after_create_account(new_user, auth_without_groups) 
+        }.not_to raise_error
+      end
+    end
+
+    describe "json_walk for groups" do
+      it "can extract groups from nested JSON" do
+        authenticator = OAuth2BasicAuthenticator.new
+        json_string = '{"user":{"roles":["developer","admin","manager"]}}'
+        SiteSetting.oauth2_json_groups_path = "user.roles"
+        
+        result = authenticator.json_walk({}, JSON.parse(json_string), :groups)
+        
+        expect(result).to eq(["developer", "admin", "manager"])
+      end
+
+      it "can extract groups from flat JSON" do
+        authenticator = OAuth2BasicAuthenticator.new
+        json_string = '{"groups":["team1","team2"]}'
+        SiteSetting.oauth2_json_groups_path = "groups"
+        
+        result = authenticator.json_walk({}, JSON.parse(json_string), :groups)
+        
+        expect(result).to eq(["team1", "team2"])
+      end
+
+      it "handles comma-separated group strings" do
+        authenticator = OAuth2BasicAuthenticator.new
+        json_string = '{"roles":"developer,admin,manager"}'
+        SiteSetting.oauth2_json_groups_path = "roles"
+        
+        result = authenticator.json_walk({}, JSON.parse(json_string), :groups)
+        
+        expect(result).to eq("developer,admin,manager")
+        
+        # Test that synchronize_groups can handle this format
+        expect { 
+          authenticator.synchronize_groups(user, result.split(",")) 
+        }.to change { Group.count }.by(3)
+      end
+    end
+
+    describe "integration with GroupActionLogger" do
+      before { SiteSetting.oauth2_debug_auth = true }
+
+      it "logs group additions" do
+        group1 # create group
+        
+        expect(GroupActionLogger).to receive(:new).with(Discourse.system_user, group1).and_call_original
+        expect_any_instance_of(GroupActionLogger).to receive(:log_add_user_to_group).with(user)
+        
+        authenticator.synchronize_groups(user, ["developers"])
+      end
+
+      it "logs group removals" do
+        group1 # create group
+        user.groups << group1
+        
+        expect(GroupActionLogger).to receive(:new).with(Discourse.system_user, group1).and_call_original
+        expect_any_instance_of(GroupActionLogger).to receive(:log_remove_user_from_group).with(user)
+        
+        authenticator.synchronize_groups(user, [])
+      end
+    end
+  end
 end

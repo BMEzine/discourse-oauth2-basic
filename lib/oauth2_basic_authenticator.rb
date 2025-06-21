@@ -207,11 +207,22 @@ class OAuth2BasicAuthenticator < Auth::ManagedAuthenticator
   def synchronize_groups(user, groups)
     log("synchronizing groups for user #{user.username}: #{groups}")
 
-    names = groups.map(&:downcase).map { |name| name.gsub(" ", "_") }
+    # Handle different input types: array, string, or nil
+    if groups.nil?
+      names = []
+    elsif groups.is_a?(Array)
+      names = groups.map(&:to_s).map(&:downcase).map { |name| name.gsub(" ", "_") }
+    elsif groups.is_a?(String)
+      names = groups.split(",").map(&:strip).map(&:downcase).map { |name| name.gsub(" ", "_") }
+    else
+      names = []
+    end
 
-    log("groups: #{names}")
+    log("processed group names: #{names}")
 
+    # Create groups that don't exist
     names.each do |name|
+      next if name.blank?
       group = Group.find_by(name: name)
       if group.blank?
         log("creating group #{name}")
